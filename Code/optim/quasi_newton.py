@@ -14,9 +14,6 @@ SSBFGS and SSBroyden — under the general self-scaled Broyden family (eq. 10):
 
 where τ_k (scaling) and φ_k (updating) differ per algorithm.
 Standard BFGS corresponds to τ_k = 1, φ_k = 1.
-
-Public API mirrors torch.optim.LBFGS so existing training loops require no
-changes other than swapping the optimizer class.
 """
 
 from __future__ import annotations
@@ -31,43 +28,42 @@ from torch.optim import Optimizer
 
 
 # ---------------------------------------------------------------------------
-# Module-level helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _dot(a: Tensor, b: Tensor) -> Tensor:
-    """Flat dot product of two parameter-space vectors."""
+    """Efficient dot product of two flat parameter vectors."""
     return torch.dot(a.view(-1), b.view(-1))
 
 
-def _matvec(H: Tensor, v: Tensor) -> Tensor:
-    """Matrix-vector product H @ v, H is (n, n), v is (n,)."""
-    return H @ v
-
-
 def _gather_flat_grad(params) -> Tensor:
-    """Concatenate all parameter gradients into a single 1-D tensor."""
+    """Concatenate all parameter gradients into a single 1‑D tensor (float64)."""
     views = []
     for p in params:
         if p.grad is None:
-            views.append(p.data.new_zeros(p.numel()))
-        elif p.grad.is_sparse:
-            views.append(p.grad.to_dense().view(-1))
+            views.append(p.data.new_zeros(p.numel(), dtype=torch.float64))
         else:
-            views.append(p.grad.view(-1))
+            views.append(p.grad.detach().to(dtype=torch.float64).view(-1))
+    return torch.cat(views)
+
+
+def _gather_flat_param(params) -> Tensor:
+    """Concatenate all parameters into a single 1‑D tensor (float64)."""
+    views = [p.data.detach().to(dtype=torch.float64).view(-1) for p in params]
     return torch.cat(views)
 
 
 def _set_params(params, flat: Tensor) -> None:
-    """Write a flat vector back into the parameter list in-place."""
+    """Write a flat vector (float64) back into parameters (preserving original dtype)."""
     offset = 0
     for p in params:
         numel = p.numel()
-        p.data.copy_(flat[offset:offset + numel].view_as(p))
+        p.data.copy_(flat[offset:offset + numel].view_as(p).to(p.dtype))
         offset += numel
 
 
 # ---------------------------------------------------------------------------
-# Abstract base
+# Abstract base class
 # ---------------------------------------------------------------------------
 
 class SelfScaledQuasiNewton(Optimizer, ABC):
@@ -78,9 +74,9 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
     The general inverse-Hessian update rule is (eq. 10 of the paper):
 
         H_{k+1} = (1/tau_k) [ H_k
-                              - (H_k y_k x H_k y_k) / (y_k . H_k y_k)
-                              + phi_k  v_k x v_k ]
-                  + (s_k x s_k) / (y_k . s_k)
+                              - (H_k y_k ⊗ H_k y_k) / (y_k . H_k y_k)
+                              + phi_k  v_k ⊗ v_k ]
+                  + (s_k ⊗ s_k) / (y_k . s_k)
 
     with auxiliary vector (eq. 9):
 
@@ -90,45 +86,7 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
     Subclasses implement :meth:`_compute_tau_phi`, which returns the pair
     ``(tau_k, phi_k)`` specific to each algorithm variant.
 
-    Public API
-    ----------
-    Matches ``torch.optim.LBFGS`` exactly so existing closures work unchanged::
-
-        optimizer = SSBFGS(model.parameters(), lr=1.0,
-                           max_iter=1, max_eval=20,
-                           history_size=100,
-                           tolerance_grad=1e-11,
-                           tolerance_change=1e-11,
-                           line_search_fn="strong_wolfe")
-
-        for epoch in range(n_epochs):
-            def closure():
-                optimizer.zero_grad()
-                loss = compute_loss(model)
-                loss.backward()
-                return loss
-            optimizer.step(closure)
-
-    Parameters
-    ----------
-    params : iterable
-        Model parameters.
-    lr : float
-        Initial line-search step size.  Default 1.0 (standard for quasi-Newton).
-    max_iter : int
-        Max quasi-Newton steps per ``step()`` call.  Set to 1 to match the
-        epoch-loop style used in the paper.
-    max_eval : int or None
-        Max function evaluations inside the line search.
-        Defaults to ``max_iter * 5`` if not given.
-    history_size : int or None
-        Accepted for API compatibility with LBFGS; not used (full H is stored).
-    tolerance_grad : float
-        Stop if the infinity-norm of the gradient is below this value.
-    tolerance_change : float
-        Stop if the infinity-norm of the parameter update is below this value.
-    line_search_fn : str or None
-        ``"strong_wolfe"`` (default) or ``None`` (fixed step lr, for debugging).
+    Public API matches torch.optim.LBFGS exactly.
     """
 
     def __init__(
@@ -137,10 +95,13 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
         lr: float = 1.0,
         max_iter: int = 1,
         max_eval: Optional[int] = None,
-        history_size: Optional[int] = None,
+        history_size: Optional[int] = None,      # kept for API compatibility
         tolerance_grad: float = 1e-9,
         tolerance_change: float = 1e-12,
         line_search_fn: Optional[str] = "strong_wolfe",
+        c1: float = 1e-4,                        # Armijo condition constant
+        c2: float = 0.9,                         # Curvature condition constant
+        beta: float = 0.5,                       # Backtracking factor
     ) -> None:
         if max_eval is None:
             max_eval = max_iter * 5
@@ -153,6 +114,9 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
             tolerance_grad=tolerance_grad,
             tolerance_change=tolerance_change,
             line_search_fn=line_search_fn,
+            c1=c1,
+            c2=c2,
+            beta=beta,
         )
         super().__init__(params, defaults)
 
@@ -162,14 +126,9 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
                 "(multiple parameter groups). Pass all parameters together."
             )
 
-    # ------------------------------------------------------------------
-    # Abstract interface — subclasses must override this
-    # ------------------------------------------------------------------
-
     @abstractmethod
     def _compute_tau_phi(
         self,
-        *,
         sk: Tensor,
         yk: Tensor,
         Hk: Tensor,
@@ -183,28 +142,23 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
         Parameters
         ----------
         sk : Tensor (n,)
-            Parameter displacement  s_k = theta_{k+1} - theta_k  (eq. 7).
+            Parameter displacement s_k = theta_{k+1} - theta_k (eq. 7).
         yk : Tensor (n,)
-            Gradient displacement  y_k = grad_J(theta_{k+1}) - grad_J(theta_k)
-            (eq. 8).
+            Gradient displacement y_k = grad_J(theta_{k+1}) - grad_J(theta_k) (eq. 8).
         Hk : Tensor (n, n)
             Current inverse-Hessian approximation.
         alpha_k : float
             Step length chosen by the line search.
         grad_k : Tensor (n,)
-            Gradient grad_J(theta_k) **before** the step (needed for eq. B.2).
+            Gradient grad_J(theta_k) before the step.
         n : int
             Total number of trainable parameters.
 
         Returns
         -------
-        tau : float    scaling  tau_k  (= 1 recovers standard BFGS)
-        phi : float    updating phi_k  (= 1 recovers standard BFGS)
+        tau : float    scaling tau_k (1 recovers standard BFGS)
+        phi : float    updating phi_k (1 recovers standard BFGS)
         """
-
-    # ------------------------------------------------------------------
-    # Shared inverse-Hessian update  (eq. 10)
-    # ------------------------------------------------------------------
 
     def _update_hessian(
         self,
@@ -216,125 +170,92 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
     ) -> Tensor:
         """
         Self-scaled Broyden inverse-Hessian update (eq. 10 of the paper).
-
-            H_{k+1} = (1/tau) [ H - Hy x Hy/(y.Hy) + phi v x v ] + s x s/(y.s)
-
-        Returns Hk unchanged if the curvature condition y.s > 0 is not met,
-        preserving positive definiteness.
+        Returns Hk unchanged if curvature condition fails.
         """
-        Hy  = _matvec(Hk, yk)       # H_k y_k
-        yHy = _dot(yk, Hy)          # y_k . H_k y_k
-        ys  = _dot(yk, sk)          # y_k . s_k
+        Hy = Hk @ yk
+        yHy = _dot(yk, Hy).item()
+        ys = _dot(yk, sk).item()
 
-        if ys.item() < 1e-20 or yHy.item() < 1e-20 or abs(tau) < 1e-20:
+        if ys < 1e-12 or yHy < 1e-12 or abs(tau) < 1e-12:
             return Hk
 
-        # v_k  (eq. 9)
-        vk = math.sqrt(yHy.item()) * (sk / ys - Hy / yHy)
+        # Auxiliary vector v_k (eq. 9)
+        vk = math.sqrt(yHy) * (sk / ys - Hy / yHy)
 
+        # Update (eq. 10)
         H_new = (1.0 / tau) * (
-            Hk
-            - torch.outer(Hy, Hy) / yHy
-            + phi * torch.outer(vk, vk)
+            Hk - torch.outer(Hy, Hy) / yHy + phi * torch.outer(vk, vk)
         ) + torch.outer(sk, sk) / ys
-
         return H_new
 
-    # ------------------------------------------------------------------
-    # Main step
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
-    def step(self, closure: Callable[[], Tensor]) -> Tensor:  # type: ignore[override]
-        """
-        Perform one (or more, if max_iter > 1) quasi-Newton step(s).
-
-        Parameters
-        ----------
-        closure : callable
-            Must zero gradients, run the forward pass, call loss.backward(),
-            and return the loss -- identical to the torch.optim.LBFGS convention.
-
-        Returns
-        -------
-        loss : Tensor   Loss at the new parameter values.
-        """
-        assert closure is not None, (
-            "SelfScaledQuasiNewton.step() requires a closure."
-        )
-
-        group  = self.param_groups[0]
-        lr     = group["lr"]
-        ls_fn  = group["line_search_fn"]
-        max_it = group["max_iter"]
-        maxev  = group["max_eval"]
+    def step(self, closure: Callable[[], Tensor]) -> Tensor:
+        """Perform one (or more, if max_iter > 1) quasi-Newton step(s)."""
+        group = self.param_groups[0]
+        lr = group["lr"]
+        max_iter = group["max_iter"]
+        max_eval = group["max_eval"]
+        tol_grad = group["tolerance_grad"]
+        tol_change = group["tolerance_change"]
+        c1 = group["c1"]
+        c2 = group["c2"]
+        beta = group["beta"]
+        ls_fn = group["line_search_fn"]
 
         params = [p for p in group["params"] if p.requires_grad]
-        n      = sum(p.numel() for p in params)
+        n = sum(p.numel() for p in params)
 
-        # Initialise state on first call
+        # Initialise state (Hessian in float64 for numerical stability)
         state = self.state[params[0]]
-        if len(state) == 0:
-            state["H"]      = torch.eye(n, dtype=params[0].dtype,
-                                        device=params[0].device)
+        if not state:
+            device = params[0].device
+            state["H"] = torch.eye(n, dtype=torch.float64, device=device)
             state["n_iter"] = 0
 
         loss = None
-        for _ in range(max_it):
-
-            # ---- 1. Evaluate loss + gradient at theta_k --------------------
+        for _ in range(max_iter):
+            # ---- 1. Evaluate loss & gradient at current point ----
             with torch.enable_grad():
                 loss = closure()
-
-            g_k = _gather_flat_grad(params).clone()
-
-            if g_k.abs().max().item() < group["tolerance_grad"]:
+            g_k = _gather_flat_grad(params)
+            if g_k.abs().max().item() < tol_grad:
                 break
 
-            H   = state["H"]
-            d_k = -_matvec(H, g_k)         # search direction  (eq. 6)
+            H = state["H"]
+            d_k = - (H @ g_k)
 
-            # If H is no longer a descent direction (numerical drift), reset it
+            # Ensure descent direction (reset Hessian if needed)
             if _dot(d_k, g_k).item() >= 0:
-                state["H"] = torch.eye(n, dtype=params[0].dtype,
-                                       device=params[0].device)
-                H   = state["H"]
+                H = torch.eye(n, dtype=torch.float64, device=g_k.device)
+                state["H"] = H
                 d_k = -g_k
 
-            x_k = torch.cat([p.data.view(-1) for p in params]).clone()
+            x_k = _gather_flat_param(params)
 
-            # ---- 2. Line search --------------------------------------------
+            # ---- 2. Line search ----
             if ls_fn == "strong_wolfe":
-                alpha, loss, g_kp1 = self._line_search_wolfe(
-                    params=params,
-                    x_k=x_k,
-                    f_k=loss,
-                    g_k=g_k,
-                    d_k=d_k,
-                    closure=closure,
-                    lr=lr,
-                    max_eval=maxev,
+                alpha, loss, g_kp1 = self._strong_wolfe(
+                    params, x_k, loss, g_k, d_k, closure,
+                    lr=lr, max_eval=max_eval, c1=c1, c2=c2,
                 )
             else:
-                alpha = lr
-                _set_params(params, x_k + alpha * d_k)
-                with torch.enable_grad():
-                    loss = closure()
-                g_kp1 = _gather_flat_grad(params).clone()
+                # Fixed step or backtracking fallback
+                alpha, loss, g_kp1 = self._backtracking(
+                    params, x_k, loss, g_k, d_k, closure,
+                    lr=lr, max_eval=max_eval, c1=c1, beta=beta,
+                )
 
-            # ---- 3. Displacements  (eqs. 7-8) ------------------------------
+            # ---- 3. Displacements (eqs. 7-8) ----
             sk = alpha * d_k
             yk = g_kp1 - g_k
 
-            # ---- 4. Hessian update  (eq. 10) --------------------------------
-            if _dot(yk, sk).item() > 1e-10:
-                tau, phi = self._compute_tau_phi(
-                    sk=sk, yk=yk, Hk=H,
-                    alpha_k=alpha, grad_k=g_k, n=n,
-                )
+            # ---- 4. Hessian update (eq. 10) ----
+            if _dot(yk, sk).item() > 1e-12:
+                tau, phi = self._compute_tau_phi(sk, yk, H, alpha, g_k, n)
                 state["H"] = self._update_hessian(H, sk, yk, tau, phi)
 
-            if sk.abs().max().item() < group["tolerance_change"]:
+            # Check for convergence
+            if sk.abs().max().item() < tol_change:
                 break
 
             state["n_iter"] += 1
@@ -342,12 +263,11 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
         return loss
 
     # ------------------------------------------------------------------
-    # Line search
+    # Strong Wolfe line search (using PyTorch's internal implementation)
     # ------------------------------------------------------------------
 
-    def _line_search_wolfe(
+    def _strong_wolfe(
         self,
-        *,
         params,
         x_k: Tensor,
         f_k: Tensor,
@@ -356,73 +276,82 @@ class SelfScaledQuasiNewton(Optimizer, ABC):
         closure: Callable,
         lr: float,
         max_eval: int,
+        c1: float,
+        c2: float,
     ) -> tuple[float, Tensor, Tensor]:
-        """
-        Strong-Wolfe line search.
-
-        Tries PyTorch's internal _strong_wolfe (same as used by LBFGS), with a
-        backtracking-Armijo fallback that is always available.
-
-        Returns
-        -------
-        alpha   : float   accepted step length
-        f_new   : Tensor  loss at the new parameters
-        g_new   : Tensor  flat gradient at the new parameters
-        """
-        # -- Attempt PyTorch's _strong_wolfe ---------------------------------
+        """Strong Wolfe line search via torch.optim.lbfgs._strong_wolfe."""
         try:
-            from torch.optim.lbfgs import _strong_wolfe  # type: ignore[import]
+            from torch.optim.lbfgs import _strong_wolfe  # type: ignore
 
             gtd = _dot(g_k, d_k).item()
 
             def obj_func(x, t, d):
-                # Evaluate at x + t*d, then restore to x (PyTorch convention).
+                # Evaluate at x + t*d, returns (f, g)
                 _set_params(params, x + t * d)
                 with torch.enable_grad():
                     f = closure()
-                g = _gather_flat_grad(params).clone()
-                _set_params(params, x)
+                g = _gather_flat_grad(params)
+                _set_params(params, x)        # restore
                 return f, g
 
+            # The line search modifies parameters in place.
             alpha, _, _, f_new, _, g_new = _strong_wolfe(
                 obj_func, x_k, lr, d_k, f_k, g_k, gtd,
-                max_ls=max_eval,
+                max_ls=max_eval, c1=c1, c2=c2,
             )
-
-            # Apply the accepted step and run closure to leave grads populated.
+            # Ensure parameters are exactly at the accepted point
             _set_params(params, x_k + alpha * d_k)
+            # Final closure run to get the correct loss/grad (safety)
             with torch.enable_grad():
-                f_new = closure()
-            g_new = _gather_flat_grad(params).clone()
-            return float(alpha), f_new, g_new
+                f_confirm = closure()
+            g_confirm = _gather_flat_grad(params)
+            return alpha, f_confirm, g_confirm
 
         except Exception:
-            pass
+            # Fallback to simple backtracking
+            return self._backtracking(
+                params, x_k, f_k, g_k, d_k, closure,
+                lr=lr, max_eval=max_eval, c1=c1, beta=0.5,
+            )
 
-        # -- Backtracking Armijo fallback ------------------------------------
-        c1    = 1e-4
+    # ------------------------------------------------------------------
+    # Backtracking Armijo fallback
+    # ------------------------------------------------------------------
+
+    def _backtracking(
+        self,
+        params,
+        x_k: Tensor,
+        f_k: Tensor,
+        g_k: Tensor,
+        d_k: Tensor,
+        closure: Callable,
+        lr: float,
+        max_eval: int,
+        c1: float,
+        beta: float,
+    ) -> tuple[float, Tensor, Tensor]:
+        """Backtracking line search (Armijo condition only)."""
         alpha = lr
-        gtd   = _dot(g_k, d_k).item()
-        f0    = f_k.item() if isinstance(f_k, Tensor) else float(f_k)
+        gtd = _dot(g_k, d_k).item()
+        f0 = f_k.item() if isinstance(f_k, Tensor) else float(f_k)
 
         for _ in range(max_eval):
             _set_params(params, x_k + alpha * d_k)
             with torch.enable_grad():
                 f_new = closure()
             if f_new.item() <= f0 + c1 * alpha * gtd:
-                g_new = _gather_flat_grad(params).clone()
+                g_new = _gather_flat_grad(params)
                 return alpha, f_new, g_new
-            alpha *= 0.5
+            alpha *= beta
 
-        _set_params(params, x_k + alpha * d_k)
-        with torch.enable_grad():
-            f_new = closure()
-        g_new = _gather_flat_grad(params).clone()
+        # If we exit the loop, take the last tried step
+        g_new = _gather_flat_grad(params)
         return alpha, f_new, g_new
 
 
 # ---------------------------------------------------------------------------
-# Concrete subclass 1: SSBFGS
+# Concrete subclass: SSBFGS
 # ---------------------------------------------------------------------------
 
 class SSBFGS(SelfScaledQuasiNewton):
@@ -430,112 +359,100 @@ class SSBFGS(SelfScaledQuasiNewton):
     Self-Scaled BFGS (Urbán et al. 2025, Section 3.2; Al-Baali 1998).
 
     Uses:
-        tau_k = min{ 1,  (y_k . s_k) / (s_k . H_k^{-1} s_k) }    (eq. 11)
+        τ_k = min{ 1,  (y_k . s_k) / (s_k . H_k^{-1} s_k) }    (eq. 11)
 
     Computed efficiently without inverting H_k via eq. B.1
-    (H_k^{-1} s_k = -alpha_k * grad_J(theta_k)):
+    (H_k^{-1} s_k = -α_k * grad_J(θ_k)):
 
-        tau_k = min{ 1,  -(y_k . s_k) / (alpha_k  s_k . grad_J(theta_k)) }
-                                                                    (eq. B.2)
-        phi_k = 1                                                   (eq. 12)
+        τ_k = min{ 1,  -(y_k . s_k) / (α_k  s_k . grad_J(θ_k)) }  (eq. B.2)
+        φ_k = 1                                                   (eq. 12)
 
-    When tau_k = 1 this reduces exactly to standard BFGS. The self-scaling
-    kicks in (tau_k < 1) only when the curvature ratio falls below 1.
+    When τ_k = 1 this reduces exactly to standard BFGS.
     """
 
-    def _compute_tau_phi(
-        self, *, sk, yk, Hk, alpha_k, grad_k, n,
-    ) -> tuple[float, float]:
-        """tau_k via eq. B.2, phi_k = 1 (eq. 12)."""
-        ys    = _dot(yk, sk).item()          # y_k . s_k
-        sg    = _dot(sk, grad_k).item()      # s_k . grad_J(theta_k)
+    def _compute_tau_phi(self, sk, yk, Hk, alpha_k, grad_k, n):
+        ys = _dot(yk, sk).item()
+        sg = _dot(sk, grad_k).item()
         denom = -alpha_k * sg
-        tau   = min(1.0, ys / denom) if abs(denom) > 1e-30 else 1.0
+        if abs(denom) > 1e-30:
+            tau = min(1.0, ys / denom)
+        else:
+            tau = 1.0
         return tau, 1.0
 
 
 # ---------------------------------------------------------------------------
-# Concrete subclass 2: SSBroyden
+# Concrete subclass: SSBroyden
 # ---------------------------------------------------------------------------
 
 class SSBroyden(SelfScaledQuasiNewton):
     """
     Self-Scaled Broyden (Urbán et al. 2025, Section 3.2; Al-Baali & Khalfan 2005).
 
-    Extends SSBFGS by also varying phi_k. Auxiliary scalars (eqs. 15-23):
+    Extends SSBFGS by also varying φ_k. Auxiliary scalars (eqs. 15-23):
 
-    b_k = -alpha_k (s_k . grad_J(theta_k)) / (y_k . s_k)   (eq. 15, via B.1)
-    h_k = (y_k . H_k y_k) / (y_k . s_k)                    (eq. 16)
-    a_k = h_k b_k - 1                                        (eq. 17)
-    c_k = sqrt(a_k / (a_k + 1))                              (eq. 18)
-    rho_k^- = min(1,  h_k (1 - c_k))                         (eq. 19)
-    theta_k^- = (rho_k^- - 1) / a_k                          (eq. 20)
-    theta_k^+ = 1 / rho_k^-                                  (eq. 21)
-    theta_k = max(theta_k^-, min(theta_k^+, (1-b_k)/b_k))    (eq. 22)
-    sigma_k = 1 + a_k theta_k                                (eq. 23)
+        b_k = -α_k (s_k . grad_J(θ_k)) / (y_k . s_k)   (eq. 15)
+        h_k = (y_k . H_k y_k) / (y_k . s_k)            (eq. 16)
+        a_k = h_k b_k - 1                              (eq. 17)
+        c_k = sqrt(a_k / (a_k + 1))                    (eq. 18)
+        ρ_k^- = min(1,  h_k (1 - c_k))                 (eq. 19)
+        θ_k^- = (ρ_k^- - 1) / a_k                      (eq. 20)
+        θ_k^+ = 1 / ρ_k^-                              (eq. 21)
+        θ_k = max(θ_k^-, min(θ_k^+, (1-b_k)/b_k))      (eq. 22)
+        σ_k = 1 + a_k θ_k                              (eq. 23)
 
     Updating parameter (eq. 14):
-        phi_k = 1 - theta_k / (1 + a_k theta_k)
+        φ_k = (1 - θ_k) / (1 + a_k θ_k)
 
     Scaling parameter (eq. 13):
-        if theta_k > 0:  tau_k = tau_k^(1) * min(sigma_k^{-1/(n-1)}, 1/theta_k)
-        else:            tau_k = min(tau_k^(1) * sigma_k^{-1/(n-1)},  sigma_k)
+        if θ_k > 0:  τ_k = τ_k^(1) * min(σ_k^{-1/(n-1)}, 1/θ_k)
+        else:        τ_k = min(τ_k^(1) * σ_k^{-1/(n-1)}, σ_k)
     """
 
-    def _compute_tau_phi(
-        self, *, sk, yk, Hk, alpha_k, grad_k, n,
-    ) -> tuple[float, float]:
-        """tau_k and phi_k via eqs. 13-23."""
-        ys  = _dot(yk, sk).item()
-        sg  = _dot(sk, grad_k).item()
-        Hy  = _matvec(Hk, yk)
+    def _compute_tau_phi(self, sk, yk, Hk, alpha_k, grad_k, n):
+        # --- basic scalars ---
+        ys = _dot(yk, sk).item()
+        sg = _dot(sk, grad_k).item()
+        Hy = Hk @ yk
         yHy = _dot(yk, Hy).item()
 
-        # b_k (eq. 15)
+        # b_k (eq. 15), h_k (eq. 16), a_k (eq. 17)
         b_k = (-alpha_k * sg) / ys if abs(ys) > 1e-30 else 1.0
-
-        # h_k (eq. 16)
         h_k = yHy / ys if abs(ys) > 1e-30 else 1.0
-
-        # a_k (eq. 17)
         a_k = h_k * b_k - 1.0
 
-        # c_k (eq. 18) — clamp argument to [0, inf) for safety
+        # c_k (eq. 18) – protect sqrt argument
         ratio = a_k / (a_k + 1.0) if abs(a_k + 1.0) > 1e-30 else 0.0
-        c_k   = math.sqrt(max(ratio, 0.0))
+        c_k = math.sqrt(max(ratio, 0.0))
 
-        # rho_k^- (eq. 19)
+        # ρ_k^- (eq. 19), θ_k^- (eq. 20), θ_k^+ (eq. 21)
         rho_minus = min(1.0, h_k * (1.0 - c_k))
-
-        # theta_k^- (eq. 20)
         theta_minus = (rho_minus - 1.0) / a_k if abs(a_k) > 1e-30 else 0.0
-
-        # theta_k^+ (eq. 21)
         theta_plus = 1.0 / rho_minus if abs(rho_minus) > 1e-30 else float("inf")
 
-        # theta_k (eq. 22)
-        mid     = (1.0 - b_k) / b_k if abs(b_k) > 1e-30 else 0.0
+        # θ_k (eq. 22)
+        mid = (1.0 - b_k) / b_k if abs(b_k) > 1e-30 else 0.0
         theta_k = max(theta_minus, min(theta_plus, mid))
 
-        # sigma_k (eq. 23)
+        # σ_k (eq. 23)
         sigma_k = 1.0 + a_k * theta_k
 
-        # tau_k^(1) from SSBFGS (eq. B.2)
-        denom_tau1 = -alpha_k * sg
-        tau1 = min(1.0, ys / denom_tau1) if abs(denom_tau1) > 1e-30 else 1.0
+        # τ_k^(1) from SSBFGS (eq. B.2)
+        tau1 = min(1.0, -ys / (alpha_k * sg)) if abs(alpha_k * sg) > 1e-30 else 1.0
 
-        # tau_k (eq. 13)
-        exp_val     = -1.0 / max(n - 1, 1)
+        # σ_k^{-1/(n-1)} with protection for n=1 (unlikely in PINNs)
+        exp_val = -1.0 / max(n - 1, 1)
         sigma_power = abs(sigma_k) ** exp_val if abs(sigma_k) > 1e-30 else 1.0
 
+        # τ_k (eq. 13)
         if theta_k > 0.0:
             inv_theta = 1.0 / theta_k if abs(theta_k) > 1e-30 else float("inf")
             tau = tau1 * min(sigma_power, inv_theta)
         else:
             tau = min(tau1 * sigma_power, sigma_k)
 
-        # phi_k (eq. 14)
+        # φ_k (eq. 14)
         denom_phi = 1.0 + a_k * theta_k
         phi = 1.0 - theta_k / denom_phi if abs(denom_phi) > 1e-30 else 1.0
 
-        return float(tau), float(phi)
+        return tau, phi
